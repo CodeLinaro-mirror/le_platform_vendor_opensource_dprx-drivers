@@ -344,8 +344,8 @@ static char *event_id_to_string(uint32_t type)
 {
 	if (type == V4L2_EVENT_SOURCE_CHANGE)
 		return "V4L2_EVENT_SOURCE_CHANGE";
-	if (type == V4L2_EVENT_PRIVATE_START)
-		return "V4L2_EVENT_PRIVATE_START";
+	if (type == V4L2_EVENT_EOS)
+		return "V4L2_EVENT_EOS";
 
 	return "UNKNOWN";
 }

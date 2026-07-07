@@ -42,6 +42,42 @@ static bool module_removed;
 static void virtio_dprx_session_free(struct virtual_dprx_dev *vdprx,
 				      struct virtio_dprx_session *session);
 
+/*
+ * Signal a source plug-IN as the standard V4L2_EVENT_SOURCE_CHANGE, mirroring
+ * HDMI/DP receiver drivers: userspace re-queries the format to learn the new
+ * resolution.
+ */
+static void dprx_queue_source_change(struct virtio_dprx_session *session)
+{
+	struct v4l2_event event = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+	};
+
+	v4l2_event_queue_fh(&session->fh, &event);
+	wake_up_interruptible(&session->fh.wait);
+}
+
+/*
+ * Signal a source plug-OUT. V4L2 has no dedicated disconnect event, so this
+ * reuses the standard V4L2_EVENT_EOS ("source stream ended") so userspace can
+ * distinguish it from a plug-in (V4L2_EVENT_SOURCE_CHANGE) purely by
+ * v4l2_event.type, without introducing a vendor-private event. The PVM-side
+ * error code is carried in u.data[0] so userspace can decode the disconnect
+ * reason.
+ */
+static void dprx_queue_source_disconnect(struct virtio_dprx_session *session,
+					 u32 errno)
+{
+	struct v4l2_event event = {
+		.type = V4L2_EVENT_EOS,
+		.u.data[0] = errno,
+	};
+
+	v4l2_event_queue_fh(&session->fh, &event);
+	wake_up_interruptible(&session->fh.wait);
+}
+
 static char *event_id_to_string(struct virtio_media_event_header *hdr)
 {
 	switch (hdr->event) {
@@ -95,30 +131,41 @@ start_thread:
 
 	pr_err("Exiting event thread");
 	if (!module_removed) {
+		unsigned int backoff_ms = 100;
+
 		pr_err("module_removed access data");
 		mutex_lock(&vdprx->sessions_lock);
 		struct list_head *p;
 		list_for_each(p, &vdprx->sessions) {
 			struct virtio_dprx_session *s =
 				list_entry(p, struct virtio_dprx_session, list);
-			struct v4l2_event v4l2_err_evt = {
-				.type = V4L2_EVENT_PRIVATE_START, // a custom error event type
-				.u.data[0] = 1,    // pass error code
-			};
 
-			v4l2_event_queue_fh(&s->fh, &v4l2_err_evt);
-			wake_up_interruptible(&s->fh.wait);
+			dprx_queue_source_disconnect(s, 1);
 		}
 		mutex_unlock(&vdprx->sessions_lock);
 
 		virtio_dprx_virtq_close(vdprx);
 
+		/*
+		 * The device link is gone (e.g. STR). Keep retrying to reopen
+		 * the virtq with a bounded backoff until it comes back or the
+		 * module is removed.
+		 */
 		pr_info("virtio_dprx_virtq_open waiting");
-		if (!virtio_dprx_virtq_open(vdprx, vdprx->cell_index)) {
-			vdprx->stop = false;
-			goto start_thread;
+		while (!module_removed) {
+			if (!virtio_dprx_virtq_open(vdprx, vdprx->cell_index)) {
+				vdprx->stop = false;
+				pr_info("virtio_dprx_virtq_open done");
+				goto start_thread;
+			}
+
+			if (msleep_interruptible(backoff_ms))
+				continue;
+
+			if (backoff_ms < 1000)
+				backoff_ms = min(backoff_ms * 2, 1000U);
 		}
-		pr_info("virtio_dprx_virtq_open done");
+		pr_info("module removed while waiting to reopen virtq");
 	}
 	else
 		pr_info("module removed so nothing to be done");
@@ -388,17 +435,17 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 		case VIRTIO_MEDIA_EVT_ERROR:
 			error_evt = (struct virtio_media_event_error *)evt;
 
-			vdprx_trace_event_record(vdprx, V4L2_EVENT_PRIVATE_START,
+			vdprx_trace_event_record(vdprx, V4L2_EVENT_EOS,
                                      error_evt->hdr.session_id, error_evt->errno);
 
 			pr_err("received error %d for session %d \n",
 				error_evt->errno, error_evt->hdr.session_id);
-			struct v4l2_event v4l2_err_evt = {
-				.type = V4L2_EVENT_PRIVATE_START, // a custom error event type
-				.u.data[0] = error_evt->errno,    // pass error code
-			};
-			v4l2_event_queue_fh(&session->fh, &v4l2_err_evt);
-			wake_up_interruptible(&session->fh.wait);
+			/*
+			 * The backend reports a source unplug (HPD) via
+			 * EVT_ERROR. Surface it as V4L2_EVENT_EOS so userspace
+			 * can tell it apart from a plug-in (SOURCE_CHANGE).
+			 */
+			dprx_queue_source_disconnect(session, error_evt->errno);
 			len = sizeof(struct virtio_media_event_error);
 			memset((char *)evt, 0x00, len);
 			break;
@@ -420,12 +467,7 @@ void virtio_dprx_process_events(struct virtual_dprx_dev *vdprx)
 					event_evt->hdr.session_id,
 					V4L2_EVENT_SRC_CH_RESOLUTION);
 
-			struct v4l2_event event = {
-				.type = V4L2_EVENT_SOURCE_CHANGE,
-				.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
-			};
-			v4l2_event_queue_fh(&session->fh, &event);
-			wake_up_interruptible(&session->fh.wait);
+			dprx_queue_source_change(session);
 			len = sizeof(struct virtio_media_event_event);
 			memset((char *)evt, 0x00, len);
 			break;
