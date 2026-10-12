@@ -420,6 +420,10 @@ static void virtio_dprx_clear_queue( struct virtual_dprx_dev *vdprx,
 	for (i = 0; i < queue->allocated_bufs; i++) {
 		queue->buffers[i].buffer.flags = 0;
 		virtio_dprx_unexport_memory(vdprx, &queue->buffers[i]);
+		if (queue->buffers[i].dbuf) {
+                        dma_buf_put(queue->buffers[i].dbuf);
+                        queue->buffers[i].dbuf = NULL;
+                }
 	}
 
 	queue->queued_bufs = 0;
@@ -692,7 +696,7 @@ static int virtio_dprx_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	if (!prepared ) {
 		buffer->buffer.m = b->m;
 		buffer->buffer.length = b->length;
-		if (b->memory == V4L2_MEMORY_DMABUF) {
+		if (b->memory == V4L2_MEMORY_DMABUF && !buffer->dbuf) {
 			buffer->dbuf = dma_buf_get(b->m.fd);
 		}
 	}
